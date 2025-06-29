@@ -277,5 +277,9 @@ async def deletetable(ctx, tablename):
     except:
         await ctx.send("⌛ Confirmation timed out. Table not deleted.")
 
+@bot.event
+async def on_ready():
+    await bot.change_presence(activity=discord.Game(name="Use !commands"))
+
 
 bot.run(TOKEN)
