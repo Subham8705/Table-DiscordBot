@@ -2,37 +2,53 @@ import discord
 from discord.ext import commands
 from tabulate import tabulate
 from dotenv import load_dotenv
-import os, json
-import shlex
+import os, shlex
 from keep_alive import keep_alive
+import re 
 
+# ✅ Firebase Setup
+import firebase_admin
+from firebase_admin import credentials, db
+
+# 🌐 Start Flask keep-alive server
 keep_alive()
 
+# 🌍 Load .env token
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ✅ Firebase Initialization
+if not firebase_admin._apps:  # Prevent double initialization
+    import json
+    cred_dict = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
+    cred = credentials.Certificate(cred_dict)
+
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://tablebot-a7488.firebaseio.com/'
+    })
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# === Load & Save Table Functions ===
-DATA_FILE = "tables.json"
+# === Firebase Load & Save Helpers ===
 
+def get_table(guild_id, tablename):
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    return ref.get()
 
-def load_tables():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def get_all_tables(guild_id):
+    ref = db.reference(f"servers/{guild_id}")
+    return ref.get() or {}
 
+def save_table(guild_id, tablename, data):
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    ref.set(data)
 
-def save_tables():
-    with open(DATA_FILE, "w") as f:
-        json.dump(tables, f, indent=2)
-
-
-tables = load_tables()
+def delete_table(guild_id, tablename):
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    ref.delete()
 
 # === Commands ===
 
@@ -40,90 +56,159 @@ tables = load_tables()
 @bot.command()
 async def newtable(ctx, tablename):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables:
-        tables[guild_id] = {}
-    if tablename in tables[guild_id]:
-        await ctx.send("Table already exists!")
+
+    # ✅ Validate table name
+    if not re.match(r'^[a-zA-Z0-9_-]+$', tablename):
+        return await ctx.send(
+            "❌ Invalid table name. Use only letters, numbers, hyphens (-), and underscores (_)."
+        )
+
+    existing = get_table(guild_id, tablename)
+
+    if existing:
+        await ctx.send("⚠️ Table already exists!")
     else:
-        tables[guild_id][tablename] = {"columns": [], "rows": []}
-        save_tables()
-        await ctx.send(f"Table '{tablename}' created.")
+        new_data = {"columns": [], "rows": []}
+        save_table(guild_id, tablename, new_data)
+        await ctx.send(f"✅ Table '{tablename}' created.")
 
 
 @bot.command()
 async def addcol(ctx, tablename, *, colname):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
-    tables[guild_id][tablename]["columns"].append(colname)
-    for row in tables[guild_id][tablename]["rows"]:
+    table = get_table(guild_id, tablename)
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
+    table["columns"].append(colname)
+    for row in table["rows"]:
         row.append("")
-    save_tables()
-    await ctx.send(f"Column '{colname}' added to '{tablename}'.")
+
+    save_table(guild_id, tablename, table)
+    await ctx.send(f"📌 Column '{colname}' added to '{tablename}'.")
 
 
 @bot.command()
 async def addrow(ctx, tablename, *, row_data):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    table = get_table(guild_id, tablename)
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
 
     try:
         values = shlex.split(row_data)
     except ValueError:
-        return await ctx.send(
-            "❌ Error parsing row. Use quotes for multi-word entries.")
+        return await ctx.send("❌ Error parsing row. Use quotes for multi-word entries.")
 
-    expected = len(tables[guild_id][tablename]["columns"])
+    expected = len(table["columns"])
     if len(values) != expected:
-        return await ctx.send(
-            f"❌ Expected {expected} values, but got {len(values)}.")
+        return await ctx.send(f"❌ Expected {expected} values, but got {len(values)}.")
 
-    tables[guild_id][tablename]["rows"].append(values)
-    save_tables()
+    table["rows"].append(values)
+    save_table(guild_id, tablename, table)
     await ctx.send(f"✅ Row added to '{tablename}'.")
 
 
 @bot.command()
 async def showtable(ctx, tablename):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
-    cols = tables[guild_id][tablename]["columns"]
-    rows = tables[guild_id][tablename]["rows"]
+    table = get_table(guild_id, tablename)
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
+    cols = table["columns"]
+    rows = table["rows"]
+
     if not cols:
-        return await ctx.send("No columns in this table.")
-    table_str = tabulate(rows, headers=cols, tablefmt="github")
-    await ctx.send(f"```\n{table_str}\n```")
+        return await ctx.send("⚠️ No columns in this table.")
+
+    rows_per_page = 20
+    total_pages = max(1, (len(rows) + rows_per_page - 1) // rows_per_page)
+
+    def get_page(page):
+        start = (page - 1) * rows_per_page
+        end = start + rows_per_page
+        page_rows = rows[start:end]
+        table_str = tabulate(page_rows, headers=cols, tablefmt="github")
+        return f"📄 **{tablename}** — Page {page}/{total_pages}\n```{table_str}```"
+
+    current_page = 1
+    message = await ctx.send(get_page(current_page))
+
+    if total_pages == 1:
+        return  # no need to paginate
+
+    await message.add_reaction("⬅️")
+    await message.add_reaction("➡️")
+
+    def check(reaction, user):
+        return (
+            user == ctx.author and
+            str(reaction.emoji) in ["⬅️", "➡️"] and
+            reaction.message.id == message.id
+        )
+
+    while True:
+        try:
+            reaction, user = await bot.wait_for("reaction_add", timeout=60.0, check=check)
+
+            if str(reaction.emoji) == "➡️" and current_page < total_pages:
+                current_page += 1
+            elif str(reaction.emoji) == "⬅️" and current_page > 1:
+                current_page -= 1
+            else:
+                await message.remove_reaction(reaction, user)
+                continue
+
+            await message.edit(content=get_page(current_page))
+            await message.remove_reaction(reaction, user)
+
+        except Exception:
+            break
+
 
 
 @bot.command()
 async def delrow(ctx, tablename, index: int):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
-    if index < 1 or index > len(tables[guild_id][tablename]["rows"]):
-        return await ctx.send("Invalid row number.")
-    removed = tables[guild_id][tablename]["rows"].pop(index - 1)
-    save_tables()
-    await ctx.send(f"Deleted row {index}: {removed}")
+    table = get_table(guild_id, tablename)
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
+    if index < 1 or index > len(table["rows"]):
+        return await ctx.send("❌ Invalid row number.")
+
+    removed = table["rows"].pop(index - 1)
+    save_table(guild_id, tablename, table)
+
+    await ctx.send(f"🗑️ Deleted row {index}: {removed}")
 
 
 @bot.command()
 async def delcol(ctx, tablename, *, colname):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
-    cols = tables[guild_id][tablename]["columns"]
+    table = get_table(guild_id, tablename)
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
+    cols = table["columns"]
     if colname not in cols:
-        return await ctx.send(f"Column '{colname}' not found.")
+        return await ctx.send(f"❌ Column '{colname}' not found.")
+
     col_index = cols.index(colname)
-    tables[guild_id][tablename]["columns"].pop(col_index)
-    for row in tables[guild_id][tablename]["rows"]:
+    table["columns"].pop(col_index)
+
+    for row in table["rows"]:
         if len(row) > col_index:
             row.pop(col_index)
-    save_tables()
-    await ctx.send(f"Deleted column '{colname}'.")
+
+    save_table(guild_id, tablename, table)
+    await ctx.send(f"🗑️ Deleted column '{colname}'.")
 
 
 @bot.command()
@@ -177,82 +262,100 @@ async def commands(ctx):
 @bot.command()
 async def viewtable(ctx):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or not tables[guild_id]:
+    ref = db.reference(f"servers/{guild_id}")
+    server_tables = ref.get()
+
+    if not server_tables:
         await ctx.send("🚫 No tables found.")
         return
-    table_list = "\n".join(f"- `{name}`" for name in tables[guild_id].keys())
-    await ctx.send(f"📄 **Available Tables in This Server:**\n{table_list}")
 
+    table_list = "\n".join(f"- `{name}`" for name in server_tables.keys())
+    await ctx.send(f"📄 **Available Tables in This Server:**\n{table_list}")
 
 @bot.command()
 async def editcell(ctx, tablename, row: int, column: str, *, new_value):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    table = ref.get()
 
-    table = tables[guild_id][tablename]
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
     if column not in table["columns"]:
-        return await ctx.send(f"Column '{column}' not found.")
+        return await ctx.send(f"❌ Column '{column}' not found.")
 
     if row < 1 or row > len(table["rows"]):
-        return await ctx.send("Invalid row number.")
+        return await ctx.send("❌ Invalid row number.")
 
     col_index = table["columns"].index(column)
-    tables[guild_id][tablename]["rows"][row - 1][col_index] = new_value
-    save_tables()
-    await ctx.send(f"Updated `{column}` in row {row} to `{new_value}`.")
+    table["rows"][row - 1][col_index] = new_value
 
+    ref.set(table)
+    await ctx.send(f"✅ Updated `{column}` in row {row} to `{new_value}`.")
 
 @bot.command()
 async def editrow(ctx, tablename, row: int, *values):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    table = ref.get()
 
-    table = tables[guild_id][tablename]
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
     if row < 1 or row > len(table["rows"]):
-        return await ctx.send("Invalid row number.")
+        return await ctx.send("❌ Invalid row number.")
 
     if len(values) != len(table["columns"]):
-        return await ctx.send(f"Expected {len(table['columns'])} values.")
+        return await ctx.send(f"❌ Expected {len(table['columns'])} values, but got {len(values)}.")
 
     table["rows"][row - 1] = list(values)
-    save_tables()
-    await ctx.send(f"Row {row} updated successfully.")
+    ref.set(table)
+
+    await ctx.send(f"✅ Row {row} updated successfully.")
 
 
 @bot.command()
 async def editcol(ctx, tablename, old_col: str, new_col: str):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    table = ref.get()
 
-    table = tables[guild_id][tablename]
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
     if old_col not in table["columns"]:
-        return await ctx.send(f"Column '{old_col}' not found.")
+        return await ctx.send(f"❌ Column '{old_col}' not found.")
 
     col_index = table["columns"].index(old_col)
     table["columns"][col_index] = new_col
-    save_tables()
-    await ctx.send(f"Renamed column '{old_col}' to '{new_col}'.")
+    ref.set(table)
+
+    await ctx.send(f"✅ Renamed column '{old_col}' to '{new_col}'.")
 
 
 @bot.command()
 async def cleartable(ctx, tablename):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    table = ref.get()
 
-    tables[guild_id][tablename]["rows"] = []
-    save_tables()
+    if not table:
+        return await ctx.send("🚫 Table not found.")
+
+    table["rows"] = []
+    ref.set(table)
+
     await ctx.send(f"✅ All rows in '{tablename}' have been cleared.")
 
 
 @bot.command()
 async def deletetable(ctx, tablename):
     guild_id = str(ctx.guild.id)
-    if guild_id not in tables or tablename not in tables[guild_id]:
-        return await ctx.send("Table not found.")
+    ref = db.reference(f"servers/{guild_id}/{tablename}")
+    table = ref.get()
+
+    if not table:
+        return await ctx.send("🚫 Table not found.")
 
     confirm_msg = await ctx.send(
         f"⚠️ Are you sure you want to permanently delete the table `{tablename}`?\nReact with ✅ to confirm or ❌ to cancel."
@@ -265,12 +368,9 @@ async def deletetable(ctx, tablename):
                 and reaction.message.id == confirm_msg.id)
 
     try:
-        reaction, user = await bot.wait_for("reaction_add",
-                                            timeout=30.0,
-                                            check=check)
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
         if str(reaction.emoji) == "✅":
-            del tables[guild_id][tablename]
-            save_tables()
+            ref.delete()
             await ctx.send(f"🗑️ Table `{tablename}` has been deleted.")
         else:
             await ctx.send("❌ Deletion cancelled.")

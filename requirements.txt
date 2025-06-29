@@ -2,3 +2,4 @@ discord.py
 python-dotenv
 tabulate
 flask
+firebase-admin

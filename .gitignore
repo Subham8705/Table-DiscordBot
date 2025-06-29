@@ -4,3 +4,4 @@ tables.json
 __pycache__/
 *.pyc
 .env
+firebase_credentials.json
