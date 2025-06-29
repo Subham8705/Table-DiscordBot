@@ -1,0 +1,6 @@
+# .gitignore
+.env
+tables.json
+__pycache__/
+*.pyc
+.env
